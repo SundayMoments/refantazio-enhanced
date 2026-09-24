@@ -348,7 +348,7 @@ impl eframe::App for Helper {
                 ui.horizontal(|ui| {
                     ui.heading("ReFantazio Enhanced");
                     ui.label(
-                        RichText::new("0.2.1 · Experimental")
+                        RichText::new("0.2.2 · Experimental")
                             .small()
                             .color(Color32::from_rgb(116, 202, 186)),
                     );

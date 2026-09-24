@@ -36,6 +36,23 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         section: "Luma",
+        key: "DLSSRenderPreset",
+        label: "DLSS preset",
+        default: "0",
+        kind: Kind::Choice(&[
+            ("0", "Default"),
+            ("10", "J"),
+            ("11", "K"),
+            ("12", "L"),
+            ("13", "M"),
+            ("5", "E (legacy)"),
+            ("6", "F (legacy)"),
+        ]),
+        help: "Used when DLSS is active. Default lets NVIDIA choose. E/F are deprecated. Save with the game closed; applies on next launch.",
+        group: "Image quality",
+    },
+    Setting {
+        section: "Luma",
         key: "UpscalingMode",
         label: "Upscaling",
         default: "0",

@@ -11,7 +11,7 @@ The helper validates the game and bundled files before replacing anything. The r
 Visual C++ runtime DLLs are included beside the mod; there is no runtime download or system installer.
 If Windows denies write access to the game folder, use **Relaunch as administrator** and select it again.
 
-**Settings** edits the mod's image quality, engine options, and ReShade overlay text scale.
+**Settings** edits the DLSS preset, image quality, engine options, and ReShade overlay text scale.
 Reload reads existing settings; Recommended settings only changes the form until you press Save.
 Changes apply on the next game launch. Other ReShade keys and sections are preserved.
 The helper does not edit saves, the game's resolution/FPS settings, Windows refresh rate, or driver settings.
