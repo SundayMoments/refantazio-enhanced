@@ -42,6 +42,7 @@ NVIDIA's proprietary DLSS runtime/driver remains outside the source audit: absen
 - Default the additional texture mip bias to `0`, instead of upstream's `-1`, to favor stability. It is adjustable because this can trade apparent sharpness for reduced texture shimmer.
 - Supply DLSS's optional current-color bias mask for particles. The experimental mask rejects history at 50% coverage; it can increase particle noise and can be disabled. FSR retains its continuous reactive mask.
 - Enable Luma's process DPI-awareness option for Metaphor so borderless desktop queries use physical pixels on scaled displays.
+- Check the loaded Visual C++ runtime against the compiled minimum version, rather than warning about every app-local `msvcp140.dll`. Packaging validates all four signed x64 runtime DLLs against that same minimum.
 - Repair release-mode DLSS cleanup, reset history after recreation/failure, guard invalid inputs, restore compute state, and use current scene color when DLSS fails. Correct half-pixel bloom-mask alignment in the final merge.
 
 This retains Luma's game hooks, object-motion reconstruction, rendering changes, HDR support and upstream limitations. It does not replace NVIDIA's DLSS model. The ATL-to-WRL compiler change is solely to build with the installed Visual Studio tools.

@@ -17,12 +17,17 @@ Then build locally:
 cargo test --offline --locked --manifest-path helper/Cargo.toml
 cargo clippy --offline --locked --manifest-path helper/Cargo.toml --all-targets -- -D warnings
 python tools/build_helper.py
+python tools/test_runtime.py
 ```
 
 The builder verifies `artifacts/fork` against its package manifest, collects dependency
 notices, includes the four required signed x64 Visual C++ runtime DLLs, and embeds the
 compressed bundle and per-file SHA-256 manifest in one executable. It uses the installed
-VS release redist directory; `--crt-dir` can select another licensed release copy.
+VS release redist directory, or the installed system runtime if that is newer;
+`--crt-dir` can select another licensed release copy. All four DLLs must be signed
+Microsoft x64 binaries meeting the minimum version compiled into the addon.
+An old runtime is rejected before packaging. `test_runtime.py` exercises real
+mutex, condition-variable, and semaphore operations with the exact bundled DLLs.
 It does not fetch dependencies or run any installer. Rust links its CRT statically.
 
 Outputs are under `artifacts/distribution`: the helper EXE, SHA-256 file, and `NOTICE.txt`.

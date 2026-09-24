@@ -151,10 +151,18 @@ index 1660310..081d151 100644
 \ No newline at end of file
 +}
 diff --git a/Source/Core/core.hpp b/Source/Core/core.hpp
-index ab6116c..403da19 100644
+index ab6116c..5e1285d 100644
 --- a/Source/Core/core.hpp
 +++ b/Source/Core/core.hpp
-@@ -2173,7 +2173,7 @@ namespace
+@@ -56,6 +56,7 @@
+ #include <functional>
+ #include <regex>
+ #include <ranges>
++#include "../../../src/runtime_compatibility.h"
+ 
+ // DirectX dependencies
+ #include <DirectXMath.h>
+@@ -2173,7 +2174,7 @@ namespace
  #endif
              }
  
@@ -163,6 +171,33 @@ index ab6116c..403da19 100644
  
              if (is_hlsl)
              {
+@@ -16524,15 +16525,19 @@ BOOL APIENTRY CoreMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved)
+       if (!reshade_addon_register_succeeded) load_failed = true;
+ #endif // !DISABLE_RESHADE
+ 
+-      std::filesystem::path shader_compiler_path = file_path.parent_path();
+-      shader_compiler_path.append("msvcp140.dll");
+-      if (std::filesystem::is_regular_file(shader_compiler_path))
++      // App-local Microsoft runtimes are supported. Check the loaded runtime's
++      // version, not merely whether a file exists beside the game executable.
++      if (HMODULE runtime_module = GetModuleHandleW(L"msvcp140.dll"))
+       {
+-         const std::string warn_message = "Your game has a custom version of \"msvcp140.dll\" in its path, please remove it and restart the game or Luma will possibly crash (there are no other side effects).\nWould you like to close the game now?";
+-         auto ret = MessageBoxA(NULL, warn_message.c_str(), NAME, MB_SETFOREGROUND | MB_YESNO);
+-         if (ret == IDYES)
++         uint64_t runtime_version = 0, product_version = 0;
++         const bool readable = System::GetDLLVersion(System::GetModulePath(runtime_module), runtime_version, product_version);
++         if (!readable || !RuntimeCompatibility::Compatible(runtime_version))
+          {
+-            exit(0);
++            const std::string warn_message = std::string("The loaded Visual C++ runtime is outdated or its version could not be verified.\n"
++               "Reinstall the current ReFantazio Enhanced bundle before continuing.\n\n") +
++               RuntimeCompatibility::Requirement + "\nWould you like to close the game now?";
++            if (MessageBoxA(NULL, warn_message.c_str(), NAME, MB_SETFOREGROUND | MB_YESNO) == IDYES)
++               exit(0);
+          }
+       }
+ 
 diff --git a/Source/Core/dlss/DLSS.cpp b/Source/Core/dlss/DLSS.cpp
 index cdfba21..2d136af 100644
 --- a/Source/Core/dlss/DLSS.cpp

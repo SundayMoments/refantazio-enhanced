@@ -10,12 +10,12 @@ from pathlib import Path
 import shutil
 import subprocess
 import zipfile
+from runtime import CRT_FILES, required_version, system_directory, validate_directory
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'artifacts/helper'
-VERSION = '0.2.3'
+VERSION = '0.2.4'
 GAME_SHA256 = '548ddc955c176867f062c44f94c03dd9ac33caefb278a5ac388e792aedf09504'
-CRT_FILES = ('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 
 def digest(b):
     return hashlib.sha256(b).hexdigest()
@@ -58,13 +58,12 @@ def main():
     parser.add_argument('--prepare-only', action='store_true')
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    crt = args.crt_dir
-    if not crt:
+    candidates = [args.crt_dir] if args.crt_dir else []
+    if not candidates:
         vswhere = Path(os.environ.get('ProgramFiles(x86)', 'C:/Program Files (x86)')) / 'Microsoft Visual Studio/Installer/vswhere.exe'
         vs = subprocess.check_output([str(vswhere), '-latest', '-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'], text=True).strip()
-        choices = sorted((Path(vs) / 'VC/Redist/MSVC').glob('*/x64/Microsoft.VC143.CRT'), reverse=True)
-        if not choices: raise RuntimeError('Install the VS2022 x64 release redistributable files first')
-        crt = choices[0]
+        candidates = sorted((Path(vs) / 'VC/Redist/MSVC').glob('*/x64/Microsoft.VC143.CRT'), reverse=True)
+        candidates.append(system_directory())
     base = ROOT / 'artifacts/fork'
     manifest = json.loads((ROOT / 'artifacts/fork-manifest.json').read_text())
     files = {}
@@ -74,6 +73,19 @@ def main():
         data = path.read_bytes()
         if digest(data) != expected: raise RuntimeError('Base package digest mismatch: ' + name)
         files[name] = data
+    minimum = required_version(files['Luma-Metaphor ReFantazio.addon'])
+    crt = None
+    for candidate in candidates:
+        try:
+            versions = validate_directory(candidate, minimum)
+        except (OSError, RuntimeError) as error:
+            print('Skipped runtime candidate:', error)
+            continue
+        crt = candidate
+        break
+    if crt is None:
+        raise RuntimeError(f'Provide a licensed, signed x64 Microsoft runtime >= {minimum} with --crt-dir')
+    print('Runtime requirement:', minimum, '; bundled runtime:', versions['msvcp140.dll'])
     for name in CRT_FILES:
         files[name] = (crt / name).read_bytes()
     # Ensure the distributable DLLs are unmodified, signed Microsoft release files.
