@@ -2,7 +2,7 @@
 
 Close Metaphor, run **ReFantazio Enhanced Helper**, and choose the folder containing
 `METAPHOR.exe`. Steam libraries are detected automatically; Browse handles custom locations.
-Read the bundled runtime terms under **Credits & licenses**, then select **Install bundled version**.
+Read the bundled runtime terms under **Credits & licenses**, then select **Install mod**.
 If an older Luma/ReShade installation is present, enable **Back up and replace existing mod files**.
 Remove a separate MetaphorFix installation first because its hooks overlap.
 
@@ -22,7 +22,7 @@ the files it added. If you installed over an older mod, that older mod returns.
 Keep `.refantazio-enhanced` in the game folder: it holds original backups and the installation record.
 Settings and shader caches remain after removal. Changed managed files cause a conflict
 instead of an overwrite. Restore the expected files before retrying; do not delete the backup folder.
-Missing files can be repaired with Install bundled version and do not prevent removal.
+Missing files can be repaired with Install mod and do not prevent removal.
 **Recover interrupted operation** rolls back an unfinished install, removal, or settings save.
 
 The helper has no network updater, downloads, telemetry, or account sign-in. To change versions,

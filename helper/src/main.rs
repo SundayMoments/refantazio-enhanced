@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod bundle;
+mod licenses;
 mod platform;
 mod settings;
 mod storage;
@@ -27,6 +28,8 @@ struct Helper {
     preview: Option<PathBuf>,
     preview_frames: u8,
     license_page: usize,
+    selected_license: Option<(&'static str, &'static str)>,
+    preview_license: bool,
 }
 impl Helper {
     fn new(cc: &eframe::CreationContext<'_>, preview: Option<PathBuf>) -> Self {
@@ -36,8 +39,16 @@ impl Helper {
         style.visuals.panel_fill = Color32::from_rgb(20, 24, 29);
         style.visuals.override_text_color = Some(Color32::from_rgb(220, 224, 231));
         style.visuals.selection.bg_fill = Color32::from_rgb(159, 34, 58);
-        style.spacing.item_spacing = egui::vec2(12., 12.);
-        style.spacing.button_padding = egui::vec2(16., 9.);
+        style.spacing.item_spacing = egui::vec2(16., 14.);
+        style.spacing.button_padding = egui::vec2(16., 8.);
+        style.spacing.interact_size.y = 24.;
+        style.spacing.slider_width = 150.;
+        style.spacing.scroll = egui::style::ScrollStyle::solid();
+        style.visuals.hyperlink_color = Color32::from_rgb(116, 202, 186);
+        if preview.is_some() {
+            style.animation_time = 0.;
+            style.scroll_animation = egui::style::ScrollAnimation::none();
+        }
         style
             .text_styles
             .insert(egui::TextStyle::Body, egui::FontId::proportional(16.));
@@ -46,7 +57,7 @@ impl Helper {
             .insert(egui::TextStyle::Button, egui::FontId::proportional(16.));
         style
             .text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(27.));
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(24.));
         cc.egui_ctx.set_style_of(egui::Theme::Dark, style);
         let folder = if preview.is_some() {
             "D:\\SteamLibrary\\steamapps\\common\\METAPHOR".into()
@@ -75,6 +86,8 @@ impl Helper {
             preview,
             preview_frames: 0,
             license_page: 0,
+            selected_license: None,
+            preview_license: false,
         }
     }
     fn result(&mut self, result: Result<String>) {
@@ -134,7 +147,11 @@ impl Helper {
         }
     }
     fn install_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label("Steam build 18330018 · NVIDIA RTX for DLSS");
+        ui.label(
+            RichText::new("Steam build 18330018 · NVIDIA RTX for DLSS")
+                .size(14.)
+                .weak(),
+        );
         ui.add_space(10.);
         ui.checkbox(&mut self.replace,"Back up and replace existing mod files").on_hover_text("Use when switching from an existing Luma/ReShade installation. Removing this bundle restores those previous files.");
         ui.checkbox(&mut self.accepted, "Accept bundled runtime licenses")
@@ -142,7 +159,7 @@ impl Helper {
         if ui
             .add_enabled(
                 self.accepted && bundle::AVAILABLE,
-                egui::Button::new("Install bundled version").fill(Color32::from_rgb(159, 34, 58)),
+                egui::Button::new("Install mod").fill(Color32::from_rgb(159, 34, 58)),
             )
             .clicked()
         {
@@ -153,8 +170,10 @@ impl Helper {
         if !bundle::AVAILABLE {
             ui.label("Development build — mod files are not embedded.");
         }
-        ui.add_space(14.);
+        ui.add_space(16.);
         ui.separator();
+        ui.add_space(4.);
+        ui.label(RichText::new("Removal").strong().size(19.));
         ui.checkbox(&mut self.remove_confirm, "Restore previous files")
             .on_hover_text(
                 "Removing this mod restores the files backed up before its first installation.",
@@ -179,7 +198,7 @@ impl Helper {
         });
     }
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Reload settings").clicked() {
                 self.load_settings();
             }
@@ -210,17 +229,24 @@ impl Helper {
                 });
             }
         });
-        ui.label("Close the game before saving. Hover a setting for details.");
+        ui.label(
+            RichText::new("Close the game before saving. Hover a setting for details.")
+                .size(14.)
+                .weak(),
+        );
         let Some(doc) = &mut self.document else {
             ui.label("Load your game's settings to edit them.");
             return;
         };
         for group in ["Overlay", "Image quality", "Game"] {
-            ui.add_space(6.);
+            ui.add_space(12.);
             ui.label(RichText::new(group).strong().size(19.));
             egui::Grid::new(group)
                 .num_columns(2)
-                .spacing([24., 12.])
+                .min_col_width(264.)
+                .max_col_width(264.)
+                .min_row_height(38.)
+                .spacing([24., 14.])
                 .show(ui, |ui| {
                     for setting in settings::SETTINGS.iter().filter(|s| s.group == group) {
                         ui.label(setting.label).on_hover_text(setting.help);
@@ -253,7 +279,7 @@ impl Helper {
                                             .map(|(_, s)| *s)
                                             .unwrap_or("Custom (choose a value)"),
                                     )
-                                    .width(220.)
+                                    .width(250.)
                                     .show_ui(ui, |ui| {
                                         for (v, label) in options {
                                             ui.selectable_value(&mut value, (*v).into(), *label);
@@ -270,7 +296,7 @@ impl Helper {
         }
     }
     fn about_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Credits");
+        ui.label(RichText::new("Credits").strong().size(19.));
         ui.label("Idarion · Metaphor integration\nFilippo Tarpini / Pumbo & contributors · Luma Framework\nLyall · MetaphorFix\nPatrick Mours & contributors · ReShade\nNVIDIA RTX™ · DLSS / NGX");
         ui.label("Independent experimental fork. No affiliation or endorsement is claimed.");
         ui.separator();
@@ -283,9 +309,15 @@ impl Helper {
                 egui::Label::new(include_str!("../../licenses/Microsoft-VC-Runtime.txt")).wrap(),
             );
         });
-        ui.collapsing("Project license", |ui| {
-            ui.add(egui::Label::new(include_str!("../../LICENSE.md")).wrap());
-        });
+        let project = egui::CollapsingHeader::new("Project license")
+            .default_open(self.preview_license)
+            .show(ui, |ui| {
+                ui.add_space(4.);
+                licenses::project(ui, &mut self.selected_license);
+            });
+        if self.preview_license && self.preview_frames < 2 {
+            project.header_response.scroll_to_me(Some(egui::Align::TOP));
+        }
         ui.collapsing("All dependency notices", |ui| {
             let pages = bundle::NOTICES.lines().count().div_ceil(80).max(1);
             ui.horizontal(|ui| {
@@ -343,12 +375,12 @@ impl eframe::App for Helper {
                 .send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(24))
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(28))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("ReFantazio Enhanced");
                     ui.label(
-                        RichText::new("0.2.2 · Experimental")
+                        RichText::new(concat!(env!("CARGO_PKG_VERSION"), " · Experimental"))
                             .small()
                             .color(Color32::from_rgb(116, 202, 186)),
                     );
@@ -358,7 +390,7 @@ impl eframe::App for Helper {
                     ui.label("Game folder");
                     ui.horizontal(|ui| {
                         ui.add_sized(
-                            [ui.available_width() - 108., 32.],
+                            [ui.available_width() - 116., 36.],
                             egui::TextEdit::singleline(&mut self.folder)
                                 .hint_text("Folder containing METAPHOR.exe"),
                         );
@@ -375,11 +407,29 @@ impl eframe::App for Helper {
                     }
                     ui.add_space(6.);
                     ui.horizontal(|ui| {
-                        for (i, label) in ["Install & remove", "Settings", "Credits & licenses"]
+                        for (i, label) in ["Installation", "Settings", "Credits & licenses"]
                             .iter()
                             .enumerate()
                         {
-                            if ui.selectable_label(self.tab == i, *label).clicked() {
+                            let selected = self.tab == i;
+                            let text = RichText::new(*label);
+                            let response = ui.add(
+                                egui::Button::new(if selected {
+                                    text.strong()
+                                } else {
+                                    text.weak()
+                                })
+                                .selected(selected)
+                                .frame(false),
+                            );
+                            if selected {
+                                ui.painter().hline(
+                                    response.rect.x_range(),
+                                    response.rect.bottom() + 3.,
+                                    egui::Stroke::new(2., Color32::from_rgb(204, 61, 85)),
+                                );
+                            }
+                            if response.clicked() {
                                 self.tab = i;
                                 if i == 1 && self.document.is_none() {
                                     self.load_settings();
@@ -422,8 +472,11 @@ impl eframe::App for Helper {
                         }
                     });
                 egui::ScrollArea::vertical()
+                    .id_salt(("page", self.tab))
+                    .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                     .show(ui, |ui| {
+                        ui.add_space(8.);
                         ui.add_enabled_ui(self.work.is_none(), |ui| match self.tab {
                             0 => self.install_ui(ui),
                             1 => self.settings_ui(ui),
@@ -431,9 +484,10 @@ impl eframe::App for Helper {
                         });
                     });
             });
+        licenses::dialog(ui.ctx(), &mut self.selected_license);
         if let Some(path) = &self.preview {
             self.preview_frames = self.preview_frames.saturating_add(1);
-            if self.preview_frames == 3 {
+            if self.preview_frames == 5 {
                 ui.ctx()
                     .send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             }
@@ -478,23 +532,41 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([910., 620.])
-            .with_min_inner_size([740., 580.]),
+            .with_inner_size(if preview.is_some() && args.iter().any(|a| a == "narrow") {
+                [780., 620.]
+            } else {
+                [960., 720.]
+            })
+            .with_min_inner_size([780., 620.]),
         ..Default::default()
     };
-    let preview_tab = if args.get(2).is_some_and(|a| a == "settings") {
-        1
-    } else {
-        0
+    let preview_page = args
+        .get(2)
+        .and_then(|a| a.to_str())
+        .unwrap_or("")
+        .to_owned();
+    let preview_tab = match preview_page.as_str() {
+        "settings" => 1,
+        "credits" | "license" | "license-dialog" => 2,
+        _ => 0,
     };
     eframe::run_native(
         "ReFantazio Enhanced",
         options,
         Box::new(move |cc| {
             let mut app = Helper::new(cc, preview);
-            if app.preview.is_some() && preview_tab == 1 {
-                app.tab = 1;
-                app.load_settings();
+            if app.preview.is_some() {
+                app.tab = preview_tab;
+                app.preview_license = preview_page.starts_with("license");
+                if preview_tab == 1 {
+                    app.load_settings();
+                }
+                if preview_page == "license-dialog" {
+                    app.selected_license = Some((
+                        "Luma Custom MIT",
+                        licenses::embedded("licenses/Luma-Custom-MIT.txt").unwrap(),
+                    ));
+                }
             }
             Ok(Box::new(app))
         }),

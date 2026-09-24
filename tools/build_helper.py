@@ -13,7 +13,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'artifacts/helper'
-VERSION = '0.2.2'
+VERSION = '0.2.3'
 GAME_SHA256 = '548ddc955c176867f062c44f94c03dd9ac33caefb278a5ac388e792aedf09504'
 CRT_FILES = ('msvcp140.dll', 'msvcp140_atomic_wait.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 

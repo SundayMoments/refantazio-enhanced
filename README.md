@@ -10,7 +10,7 @@ An experimental **Metaphor: ReFantazio** mod combining [Luma](https://github.com
 ## Install
 
 1. Download the helper from [Releases](https://github.com/SundayMoments/refantazio-enhanced/releases).
-2. Close the game, select its folder, and click **Install bundled version**.
+2. Close the game, select its folder, and click **Install mod**.
 3. Use **Settings** to customize the mod, including ReShade's text size. Press **Home** in-game for more controls.
 
 Windows x64; Steam build **18330018**. DLSS requires an NVIDIA RTX GPU. For native-resolution DLAA, use DLSS with the game's Rendering Scale at **100%**. Your chosen FPS limit and resolution remain yours.
