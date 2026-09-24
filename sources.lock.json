@@ -1,0 +1,43 @@
+{
+  "luma": {
+    "url": "https://github.com/Filoppi/Luma-Framework.git",
+    "revision": "3d48c38c17a59136be068e1f33bd25a92be69089"
+  },
+  "reshade": {
+    "url": "https://github.com/crosire/reshade.git",
+    "revision": "eeb2c76aea8e00200d88b479c9036c5ea4d06d5e"
+  },
+  "metaphorfix": {
+    "url": "https://codeberg.org/Lyall/MetaphorFix.git",
+    "revision": "a74b056d76065f069953c27eb474d29bcdf017b0"
+  },
+  "release": {
+    "url": "https://github.com/Filoppi/Luma-Framework/releases/download/latest-704/Luma-Metaphor_ReFantazio.zip",
+    "filename": "Luma-Metaphor_ReFantazio-latest-704.zip",
+    "sha256": "b03268582488c1edf6e539b1a3e25d0d6c92b251be2bcd05bbd2c47725070373"
+  },
+  "python_build_dependencies": [
+    "Jinja2==3.1.6",
+    "MarkupSafe==3.0.3"
+  ],
+  "submodules": {
+    "Source/External/DKUtil": "0ddab238cc8c4915b9e8fda90668d74e513d534a",
+    "Source/External/reshade/deps/d3d12": "9e393d6d8a3b30dcc6f2806ef604ec16a27b0d7e",
+    "Source/External/reshade/deps/fpng": "925796543b9d26b8edfcdcecd94c1dac280f29fc",
+    "Source/External/reshade/deps/glad": "27bed1181560211b55e39a9b132fef8c5846aae5",
+    "Source/External/reshade/deps/imgui": "3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c",
+    "Source/External/reshade/deps/jxl_simple_lossless": "8dc970fc771e35239db55dfbce8f46f83f8e9b73",
+    "Source/External/reshade/deps/minhook": "8fda4f5481fed5797dc2651cd91e238e9b3928c6",
+    "Source/External/reshade/deps/openxr": "288d3a7ebc1ad959f62d51da75baa3d27438c499",
+    "Source/External/reshade/deps/spirv": "7845730cab6ebbdeb621e7349b7dc1a59c3377be",
+    "Source/External/reshade/deps/stb": "28d546d5eb77d4585506a20480f4de2e706dff4c",
+    "Source/External/reshade/deps/utfcpp": "819011bb01628fe1aa2f1da9f2c842a48fd5680b",
+    "Source/External/reshade/deps/vma": "1076b348abd17859a116f4b111c43d58a588a086"
+  },
+  "vendored_files": {
+    "vendor/safetyhook/safetyhook.cpp": "cdc97b2095887ab4591dd3dd72740b1896d16e8c2822020955d02f1e0716044f",
+    "vendor/safetyhook/safetyhook.hpp": "6db3069b0973ddcc135fa606e3dc5da523d9b7ec77664bc6cafddbfb8a8904e7",
+    "vendor/safetyhook/Zydis.c": "6346126cf55d5bd5be8c687220a1c10c6ecf1df861e18c3f6ba293293d7b4fe5",
+    "vendor/safetyhook/Zydis.h": "3bdb00d1a3a5a21b2084cd0508c992d83c9d5a374a4a984782d266e77d64a8c7"
+  }
+}

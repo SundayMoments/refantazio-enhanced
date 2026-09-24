@@ -1,0 +1,1132 @@
+diff --git a/Shaders/Metaphor ReFantazio/Luma_CopyDsrResult.hlsl b/Shaders/Metaphor ReFantazio/Luma_CopyDsrResult.hlsl
+index 296f76d..260dd8b 100644
+--- a/Shaders/Metaphor ReFantazio/Luma_CopyDsrResult.hlsl	
++++ b/Shaders/Metaphor ReFantazio/Luma_CopyDsrResult.hlsl	
+@@ -12,7 +12,7 @@ void main(uint2 tid : SV_DispatchThreadID, uint3 gid : SV_GroupId, uint gix : SV
+ 	{
+ 		return;
+ 	}
+-	float2 uv = tid.xy * LumaSettings.GameSettings.InvOutputRes;
++	float2 uv = (float2(tid) + 0.5f) * LumaSettings.GameSettings.InvOutputRes;
+ 	
+ 	float alpha = 0.0f;
+ 	[branch]
+@@ -33,5 +33,11 @@ void main(uint2 tid : SV_DispatchThreadID, uint3 gid : SV_GroupId, uint gix : SV
+ 		alpha = g_origColor.SampleLevel(g_linearSampler, uv, 0).a;
+ 	}
+ 
+-	g_outputTex[tid] = float4(g_dsrResult[tid].rgb, alpha);
+-}
+\ No newline at end of file
++#if SR_FALLBACK
++	// A failed SR evaluation must never display a stale or uninitialized result.
++	float3 color = g_origColor.SampleLevel(g_linearSampler, uv, 0).rgb;
++#else
++	float3 color = g_dsrResult[tid].rgb;
++#endif
++	g_outputTex[tid] = float4(color, alpha);
++}
+diff --git a/Shaders/Metaphor ReFantazio/Luma_CreateBiasMask.hlsl b/Shaders/Metaphor ReFantazio/Luma_CreateBiasMask.hlsl
+index 9cba8cf..d3aa88d 100644
+--- a/Shaders/Metaphor ReFantazio/Luma_CreateBiasMask.hlsl	
++++ b/Shaders/Metaphor ReFantazio/Luma_CreateBiasMask.hlsl	
+@@ -1,7 +1,7 @@
+ #include "Includes/Common.hlsl"
+ 
+ Texture2D<float4> g_particleTex : register(t0);
+-RWTexture2D<float2> g_biasMaskTex : register(u0);
++RWTexture2D<float> g_biasMaskTex : register(u0);
+ 
+ [numthreads(8, 8, 1)]
+ void main(uint2 tid : SV_DispatchThreadID, uint3 gid : SV_GroupId, uint gix : SV_GroupIndex)
+@@ -11,5 +11,8 @@ void main(uint2 tid : SV_DispatchThreadID, uint3 gid : SV_GroupId, uint gix : SV
+ 		return;
+ 	}
+ 	
+-	g_biasMaskTex[tid] = 1.0f - g_particleTex[tid].a;
+-}
+\ No newline at end of file
++	float coverage = saturate(1.0f - g_particleTex[tid].a);
++	// DLSS's current-color hint rejects history; FSR uses continuous reactivity.
++	// Avoid rejecting history for barely visible particles, which would shimmer.
++	g_biasMaskTex[tid] = LumaSettings.SRType == 1 ? step(0.5f, coverage) : coverage;
++}
+diff --git a/Shaders/Metaphor ReFantazio/Luma_PrepareMotionVector.hlsl b/Shaders/Metaphor ReFantazio/Luma_PrepareMotionVector.hlsl
+index 02209c7..702f477 100644
+--- a/Shaders/Metaphor ReFantazio/Luma_PrepareMotionVector.hlsl	
++++ b/Shaders/Metaphor ReFantazio/Luma_PrepareMotionVector.hlsl	
+@@ -24,12 +24,22 @@ void main(uint2 tid : SV_DispatchThreadID, uint3 gid : SV_GroupId, uint gix : SV
+ 	float depth = g_depthTex[tid];
+ 	if(g_depthTex[tid] == 1.0f)
+ 	{
+-		float2 texCoord = tid / LumaSettings.GameSettings.RenderRes;
+-		float4 prevTS = mul(float4(texCoord * 2.0f - 1.0f, depth, 1.0f), reprojectionMatrix);
+-		prevTS /= prevTS.w;
+-		prevTS = (prevTS + 1.0f) * 0.5f;
+-		velocity = prevTS.xy - texCoord;
++		// D3D texture UV is Y-down; clip space is Y-up. Sample pixel centers.
++		float2 texCoord = (float2(tid) + 0.5f) / LumaSettings.GameSettings.RenderRes;
++		float2 ndc = texCoord * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
++		float4 prevTS = mul(float4(ndc, depth, 1.0f), reprojectionMatrix);
++		if (all(isfinite(prevTS)) && prevTS.w > 1e-6f)
++		{
++			float2 previousUV = (prevTS.xy / prevTS.w) * float2(0.5f, -0.5f) + 0.5f;
++			velocity = previousUV - texCoord;
++		}
++		else
++		{
++			// No valid previous projection: move history outside the viewport.
++			velocity = 2.0f;
++		}
+ 	}
++	if (!all(isfinite(velocity))) velocity = 2.0f;
+ 	
+ 	g_updatedVelocityTex[tid] = velocity * LumaSettings.GameSettings.RenderRes;
+-}
+\ No newline at end of file
++}
+diff --git a/Shaders/Metaphor ReFantazio/Luma_TemporalAADepth.hlsl b/Shaders/Metaphor ReFantazio/Luma_TemporalAADepth.hlsl
+index 1660310..081d151 100644
+--- a/Shaders/Metaphor ReFantazio/Luma_TemporalAADepth.hlsl	
++++ b/Shaders/Metaphor ReFantazio/Luma_TemporalAADepth.hlsl	
+@@ -19,6 +19,7 @@ cbuffer cbTemporalAADepth : register(b0)
+ 	int UseVarianceClipping : packoffset(c1.x);
+ 	float VarianceScale : packoffset(c1.y);
+ 	float2 VelocityScale : packoffset(c1.z);
++	float2 HistoryJitterUV : packoffset(c2.x);
+ };
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -88,6 +89,8 @@ void main(
+     }
+ 
+ 	GroupMemoryBarrierWithGroupSync();
++	// All lanes must participate in the shared-memory barrier before returning.
++	if (any(dispatchID.xy >= uint2(ScreenInfo.xy))) return;
+ 	
+ 	float2 uv = (float2(dispatchID.xy) + 0.5f) * ScreenInfo.zw;
+ 	
+@@ -147,16 +150,28 @@ void main(
+ 		dither_amount = saturate((cv -  dither_threshold) * dither_weight);
+ 	}
+ 	
+-	float2 velocity = t_VelocityMap.SampleLevel(s_samplLinearClamp, uv, 0).xy * VelocityScale;
++	// Do not blend unrelated foreground/background velocities at silhouettes.
++	float2 velocity = t_VelocityMap.Load(int3(dispatchID.xy, 0)).xy * VelocityScale;
++	float2 historyUV = uv + velocity + HistoryJitterUV;
++	if (!all(isfinite(historyUV)) || any(historyUV < 0.0f) || any(historyUV > 1.0f))
++	{
++		rw_TemporalDepth[dispatchID.xy] = e;
++		return;
++	}
+ 	
+ 	float velocity_length = saturate( (abs(velocity.x * 2.0f * ScreenInfo.x) + abs(velocity.y * 2.0f * ScreenInfo.y)) * 2.0f );
+ 	
+-	float history_depth = t_TemporalDepthPrevMap.SampleLevel(s_samplPointClamp, uv + velocity, 0);
++	float history_depth = t_TemporalDepthPrevMap.SampleLevel(s_samplPointClamp, historyUV, 0);
++	if (!isfinite(history_depth))
++	{
++		rw_TemporalDepth[dispatchID.xy] = e;
++		return;
++	}
+ 	
+     float clipped_history = clamp(history_depth, variance_clip_min, variance_clip_max);
+ 	
+ 	float weight_depth = min( abs(variance_clip_min - history_depth), abs(variance_clip_max - history_depth) );
+-	weight_depth = weight_depth / ((variance_clip_max - variance_clip_min) + weight_depth);
++	weight_depth = weight_depth / max((variance_clip_max - variance_clip_min) + weight_depth, 1e-7f);
+ 	
+ 	float weight_velocity = ((velocity_length * velocity_length + velocity_length + 1.0f) * (velocity_length + 1.0f)) * 0.125f;
+ 	// (x^2 + x + 1) * (x + 1)
+@@ -168,8 +183,9 @@ void main(
+ 	rw_TemporalDepth[dispatchID.xy] = lerp(e, clipped_history, weight);
+ 	
+ #else // HAS_PREVIOUS_FRAME
++	if (any(dispatchID.xy >= uint2(ScreenInfo.xy))) return;
+ 
+ 	rw_TemporalDepth[dispatchID.xy] = LoadDepth(int2(dispatchID.xy));
+ 	
+ #endif // HAS_PREVIOUS_FRAME
+-}
+\ No newline at end of file
++}
+diff --git a/Source/Core/core.hpp b/Source/Core/core.hpp
+index ab6116c..403da19 100644
+--- a/Source/Core/core.hpp
++++ b/Source/Core/core.hpp
+@@ -2173,7 +2173,7 @@ namespace
+ #endif
+             }
+ 
+-            CComPtr<ID3DBlob> uncompiled_code_blob;
++            Microsoft::WRL::ComPtr<ID3DBlob> uncompiled_code_blob;
+ 
+             if (is_hlsl)
+             {
+diff --git a/Source/Core/dlss/DLSS.cpp b/Source/Core/dlss/DLSS.cpp
+index cdfba21..2d136af 100644
+--- a/Source/Core/dlss/DLSS.cpp
++++ b/Source/Core/dlss/DLSS.cpp
+@@ -41,32 +41,32 @@ namespace NGX
+ 		// Current global capabilities params (independent from the current settings/res).
+ 		NVSDK_NGX_Parameter*								capabilities_params = nullptr;
+ 		Microsoft::WRL::ComPtr<ID3D11Device>		device;
++		mutable bool reset_pending = true;
+ 
+ 		virtual ~DLSSInstanceData()
+ 		{
+-			// Just to be explicit
+-			device.Reset();
+-			instance.command_list.Reset();
+-
+ 			// We need to release these at the end, otherwise DLSS crashes as it holds references to them (there's probably a way to release them as they come but it doesn't really matter)
+ 			for (NVSDK_NGX_Handle* handle : unique_handles)
+ 			{
+ 				if (handle != nullptr)
+ 				{
+-					assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_ReleaseFeature(handle)));
++					const auto result = NVSDK_NGX_D3D11_ReleaseFeature(handle);
++					assert(NVSDK_NGX_SUCCEED(result));
+ 				}
+ 			}
+ 			for (NVSDK_NGX_Parameter* parameter : unique_parameters)
+ 			{
+ 				if (parameter != nullptr)
+ 				{
+-					assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_DestroyParameters(parameter)));
++					const auto result = NVSDK_NGX_D3D11_DestroyParameters(parameter);
++					assert(NVSDK_NGX_SUCCEED(result));
+ 				}
+ 			}
+ 
+ 			if (capabilities_params != nullptr)
+ 			{
+-				assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_DestroyParameters(capabilities_params)));
++				const auto result = NVSDK_NGX_D3D11_DestroyParameters(capabilities_params);
++				assert(NVSDK_NGX_SUCCEED(result));
+ 			}
+ 		}
+ 
+@@ -234,11 +234,14 @@ void NGX::DLSS::Deinit(SR::InstanceData*& data, ID3D11Device* optional_device)
+ 			assert(custom_data->device.Get() == optional_device);
+ 		}
+ 
++		// Hold the device until features are released and NGX shutdown has finished.
++		Microsoft::WRL::ComPtr<ID3D11Device> keep_device_alive = optional_device;
+ 		// Needs to be done before "NVSDK_NGX_D3D11_Shutdown1()"
+ 		delete custom_data;
+ 		custom_data = nullptr;
+ 
+-		assert(NVSDK_NGX_SUCCEED(NVSDK_NGX_D3D11_Shutdown1(optional_device)));
++		const auto result = NVSDK_NGX_D3D11_Shutdown1(optional_device);
++		assert(NVSDK_NGX_SUCCEED(result));
+ 	}
+ }
+ 
+@@ -256,8 +259,9 @@ int NGX::DLSS::GetJitterPhases(const SR::InstanceData* data) const
+ {
+ 	// Nvidia suggested formula.
+ 	constexpr int base_phases = SR::GetDefaultJitterPhases(); // We start from a baseline of 8, for native resolution (DLAA).
++	if (!data || data->settings_data.render_height == 0 || data->settings_data.output_height == 0) return base_phases;
+ 	// Use Y resolution as it's generally more reliable.
+-   return std::lrintf(float(base_phases) * pow(max(float(data->settings_data.output_height) / float(data->settings_data.render_height), 1.f), 2.f));
++   return std::lrintf(float(base_phases) * pow((std::max)(float(data->settings_data.output_height) / float(data->settings_data.render_height), 1.f), 2.f));
+ }
+ 
+ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* command_list, const SR::SettingsData& settings_data)
+@@ -267,6 +271,8 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
+ 	// Early exit if DLSS is not supported by hardware or driver.
+ 	if (!command_list || !custom_data || !custom_data->is_supported)
+ 		return false;
++	if (!settings_data.render_width || !settings_data.render_height || !settings_data.output_width || !settings_data.output_height)
++		return false;
+ 
+ #ifndef NDEBUG 
+ 	Microsoft::WRL::ComPtr<ID3D11Device> device;
+@@ -360,6 +366,7 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
+ 	}
+ 
+ 	custom_data->settings_data = settings_data;
++	custom_data->reset_pending = true;
+ 	custom_data->instance.command_list.Reset(); // Just to be explicit
+ 	custom_data->instance = custom_data->CreateSuperSamplingFeature(command_list, quality_mode);
+ 	custom_data->unique_handles.insert(custom_data->instance.super_sampling_feature);
+@@ -372,6 +379,14 @@ bool NGX::DLSS::UpdateSettings(SR::InstanceData* data, ID3D11DeviceContext* comm
+ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_list, const DrawData& draw_data)
+ {
+ 	const auto& custom_data = reinterpret_cast<const DLSSInstanceData*&>(data);
++	if (!custom_data || !custom_data->is_supported || !command_list ||
++		!custom_data->instance.super_sampling_feature || !custom_data->instance.runtime_params ||
++		custom_data->instance.command_list.Get() != command_list ||
++		!draw_data.source_color || !draw_data.output_color || !draw_data.depth_buffer || !draw_data.motion_vectors)
++	{
++		if (custom_data) custom_data->reset_pending = true;
++		return false;
++	}
+ 
+ 	assert(custom_data->is_supported);
+ 	assert(custom_data->instance.super_sampling_feature != nullptr && custom_data->instance.runtime_params != nullptr);
+@@ -391,9 +406,18 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
+ 	{
+ 		render_height = custom_data->settings_data.render_height;
+ 	}
++	if (!render_width || !render_height || render_width > custom_data->settings_data.render_width ||
++		render_height > custom_data->settings_data.render_height ||
++		!std::isfinite(draw_data.jitter_x) || !std::isfinite(draw_data.jitter_y) ||
++		!std::isfinite(draw_data.pre_exposure) || draw_data.pre_exposure < 0.f)
++	{
++		custom_data->reset_pending = true;
++		return false;
++	}
+ 
+ 	eval_params.pInDepth = draw_data.depth_buffer;
+ 	eval_params.pInMotionVectors = draw_data.motion_vectors;
++	eval_params.pInBiasCurrentColorMask = draw_data.current_color_bias;
+ 	eval_params.InRenderSubrectDimensions.Width = render_width;
+ 	eval_params.InRenderSubrectDimensions.Height = render_height;
+ 	eval_params.Feature.pInColor = draw_data.source_color;
+@@ -403,7 +427,7 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
+ 	{
+ 		eval_params.InPreExposure = draw_data.pre_exposure;
+ 	}
+-	eval_params.InReset = draw_data.reset ? 1 : 0;
++	eval_params.InReset = draw_data.reset || custom_data->reset_pending ? 1 : 0;
+ 	// MVs need to have positive values when moving towards the top left of the screen
+ 	eval_params.InMVScaleX = custom_data->settings_data.mvs_x_scale;
+ 	eval_params.InMVScaleY = custom_data->settings_data.mvs_y_scale;
+@@ -419,7 +443,8 @@ bool NGX::DLSS::Draw(const SR::InstanceData* data, ID3D11DeviceContext* command_
+ 
+ 	//ASSERT_MSGF(NVSDK_NGX_SUCCEED(result), "DLSS Error: %u\n", uint32_t(result));
+ 
++	custom_data->reset_pending = NVSDK_NGX_FAILED(result);
+ 	return NVSDK_NGX_SUCCEED(result);
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/Source/Core/includes/super_resolution.h b/Source/Core/includes/super_resolution.h
+index 7ac6e5a..325e2d4 100644
+--- a/Source/Core/includes/super_resolution.h
++++ b/Source/Core/includes/super_resolution.h
+@@ -174,6 +174,7 @@ namespace SR
+ 			// Optional data:
+ 			ID3D11Resource* exposure = nullptr; // Can be left nullptr to default to 1 or to auto exposure
+ 			ID3D11Resource* bias_mask = nullptr; // Reactivity/Bias mask (might not be used by all SR implementations)
++			ID3D11Resource* current_color_bias = nullptr; // Optional DLSS history rejection, distinct from FSR reactivity.
+ 			ID3D11Resource* transparency_alpha = nullptr; // Amount of intensity in this pixel (only used by some FSR implementations)
+ 
+ 			unsigned int render_width = 0;
+diff --git a/Source/Core/utils/shader_compiler.hpp b/Source/Core/utils/shader_compiler.hpp
+index b742e9b..0c653eb 100644
+--- a/Source/Core/utils/shader_compiler.hpp
++++ b/Source/Core/utils/shader_compiler.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include <atlbase.h>
++#include <wrl/client.h>
+ #include <d3dcompiler.h>
+ #include <dxcapi.h>
+ 
+@@ -16,6 +16,19 @@
+ 
+ namespace Shader
+ {
++   // Windows SDK/WRL only: building the shader compiler does not require ATL.
++   inline std::wstring Utf8ToWide(const char* text)
++   {
++      if (!text) return {};
++      const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, nullptr, 0);
++      if (count == 0) throw HRESULT_FROM_WIN32(GetLastError());
++      std::wstring result(count, L'\0');
++      if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, result.data(), count))
++         throw HRESULT_FROM_WIN32(GetLastError());
++      result.pop_back();
++      return result;
++   }
++
+    static HMODULE d3d_compiler;
+ 
+    typedef HRESULT(WINAPI* pD3DDisassemble)(LPCVOID, SIZE_T, UINT, LPCSTR, ID3DBlob**);
+@@ -343,7 +356,7 @@ namespace Shader
+ 
+       if (d3d_disassemble != nullptr)
+       {
+-         CComPtr<ID3DBlob> out_blob;
++         Microsoft::WRL::ComPtr<ID3DBlob> out_blob;
+          HRESULT hr = d3d_disassemble(
+             data,
+             size,
+@@ -395,19 +408,19 @@ namespace Shader
+ 
+    std::optional<std::string> DisassembleShaderDXC(const void* data, size_t size)
+    {
+-      CComPtr<IDxcLibrary> library;
+-      CComPtr<IDxcCompiler> compiler;
+-      CComPtr<IDxcBlobEncoding> source;
+-      CComPtr<IDxcBlobEncoding> disassembly_text;
+-      CComPtr<ID3DBlob> disassembly;
++      Microsoft::WRL::ComPtr<IDxcLibrary> library;
++      Microsoft::WRL::ComPtr<IDxcCompiler> compiler;
++      Microsoft::WRL::ComPtr<IDxcBlobEncoding> source;
++      Microsoft::WRL::ComPtr<IDxcBlobEncoding> disassembly_text;
++      Microsoft::WRL::ComPtr<ID3DBlob> disassembly;
+ 
+       std::optional<std::string> result;
+ 
+       if (FAILED(CreateLibrary(&library))) return result;
+       if (FAILED(library->CreateBlobWithEncodingFromPinned(data, size, CP_ACP, &source))) return result;
+       if (FAILED(CreateCompiler(&compiler))) return result;
+-      if (FAILED(compiler->Disassemble(source, &disassembly_text))) return result;
+-      if (FAILED(disassembly_text.QueryInterface(&disassembly))) return result;
++      if (FAILED(compiler->Disassemble(source.Get(), &disassembly_text))) return result;
++      if (FAILED(disassembly_text.As(&disassembly))) return result;
+ 
+       result = { reinterpret_cast<char*>(disassembly->GetBufferPointer()), disassembly->GetBufferSize() };
+ 
+@@ -441,7 +454,7 @@ namespace Shader
+ 
+    // Returns true if the shader changed (or if we can't compare it).
+    // Pass in "shader_name_w" as the full path to avoid needing to set the current directory.
+-   bool PreprocessShaderFromFile(LPCWSTR file_path, LPCWSTR shader_name_w, LPCSTR shader_target, std::string& preprocessed_code, std::size_t& preprocessed_hash /*= 0*/, CComPtr<ID3DBlob>& uncompiled_code_blob, const std::vector<std::string>& defines = {}, bool& error = dummy_bool, std::string* out_error = nullptr)
++   bool PreprocessShaderFromFile(LPCWSTR file_path, LPCWSTR shader_name_w, LPCSTR shader_target, std::string& preprocessed_code, std::size_t& preprocessed_hash /*= 0*/, Microsoft::WRL::ComPtr<ID3DBlob>& uncompiled_code_blob, const std::vector<std::string>& defines = {}, bool& error = dummy_bool, std::string* out_error = nullptr)
+    {
+       std::vector<D3D_SHADER_MACRO> local_defines;
+       FillDefines(defines, local_defines);
+@@ -461,8 +474,8 @@ namespace Shader
+                std::copy(shader_name_w_s.begin(), shader_name_w_s.end(), shader_name_s.begin());
+                LPCSTR shader_name = shader_name_s.c_str();
+ #pragma warning(pop)
+-               CComPtr<ID3DBlob> preprocessed_blob;
+-               CComPtr<ID3DBlob> error_blob;
++               Microsoft::WRL::ComPtr<ID3DBlob> preprocessed_blob;
++               Microsoft::WRL::ComPtr<ID3DBlob> error_blob;
+                HRESULT result = d3d_preprocess(
+                   uncompiled_code_blob->GetBufferPointer(),
+                   uncompiled_code_blob->GetBufferSize(),
+@@ -500,7 +513,7 @@ namespace Shader
+    bool LoadCompiledShaderFromFile(std::vector<uint8_t>& output, LPCWSTR file_path)
+    {
+       bool file_loaded = false;
+-      CComPtr<ID3DBlob> out_blob;
++      Microsoft::WRL::ComPtr<ID3DBlob> out_blob;
+       if (d3d_readFileToBlob != nullptr)
+       {
+          std::wstring file_path_cso = file_path;
+@@ -514,7 +527,7 @@ namespace Shader
+             file_path_cso += L".cso";
+          }
+ 
+-         CComPtr<ID3DBlob> out_blob;
++         Microsoft::WRL::ComPtr<ID3DBlob> out_blob;
+          HRESULT result = d3d_readFileToBlob(file_path_cso.c_str(), &out_blob);
+          if (SUCCEEDED(result))
+          {
+@@ -529,7 +542,7 @@ namespace Shader
+       return file_loaded;
+    }
+ 
+-   void CompileShaderFromFileFXC(std::vector<uint8_t>& output, const CComPtr<ID3DBlob>& optional_uncompiled_code_input, LPCWSTR file_read_path, LPCSTR shader_target, const D3D_SHADER_MACRO* defines = nullptr, bool save_to_disk = false, bool& error = dummy_bool, std::string* out_error = nullptr, LPCWSTR file_write_path = nullptr, LPCSTR func_name = nullptr)
++   void CompileShaderFromFileFXC(std::vector<uint8_t>& output, const Microsoft::WRL::ComPtr<ID3DBlob>& optional_uncompiled_code_input, LPCWSTR file_read_path, LPCSTR shader_target, const D3D_SHADER_MACRO* defines = nullptr, bool save_to_disk = false, bool& error = dummy_bool, std::string* out_error = nullptr, LPCWSTR file_write_path = nullptr, LPCSTR func_name = nullptr)
+    {
+       UINT flags1 = 0;
+       constexpr bool force_backwards_compatibility = false; // Expose if needed, so far no games really needed it
+@@ -559,8 +572,8 @@ namespace Shader
+ 
+       auto custom_include = FxcD3DInclude(file_read_path);
+ 
+-      CComPtr<ID3DBlob> out_blob;
+-      CComPtr<ID3DBlob> error_blob;
++      Microsoft::WRL::ComPtr<ID3DBlob> out_blob;
++      Microsoft::WRL::ComPtr<ID3DBlob> error_blob;
+       HRESULT result = E_FAIL; // Fake default error
+       if (optional_uncompiled_code_input != nullptr && d3d_compile != nullptr)
+       {
+@@ -586,8 +599,8 @@ namespace Shader
+       }
+       if (FAILED(result) && d3d_compileFromFile != nullptr)
+       {
+-         out_blob.Release();
+-         error_blob.Release();
++         out_blob.Reset();
++         error_blob.Reset();
+ 
+          result = d3d_compileFromFile(
+             file_read_path,
+@@ -620,7 +633,7 @@ namespace Shader
+             {
+                file_path_cso += L".cso";
+             }
+-            HRESULT result2 = d3d_writeBlobToFile(out_blob, file_path_cso.c_str(), overwrite);
++            HRESULT result2 = d3d_writeBlobToFile(out_blob.Get(), file_path_cso.c_str(), overwrite);
+             assert(SUCCEEDED(result2));
+          }
+       }
+@@ -687,8 +700,8 @@ namespace Shader
+       ID3DBlob** code,
+       ID3DBlob** error_messages)
+    {
+-      CComPtr<IDxcCompiler> compiler;
+-      CComPtr<IDxcOperationResult> operation_result;
++      Microsoft::WRL::ComPtr<IDxcCompiler> compiler;
++      Microsoft::WRL::ComPtr<IDxcOperationResult> operation_result;
+       HRESULT hr;
+ 
+       // Upconvert legacy targets
+@@ -702,8 +715,8 @@ namespace Shader
+ 
+       try
+       {
+-         const CA2W entrypoint_wide(entrypoint, CP_UTF8);
+-         const CA2W target_profile_wide(target, CP_UTF8);
++         const auto entrypoint_wide = Utf8ToWide(entrypoint);
++         const auto target_profile_wide = Utf8ToWide(target);
+          std::vector<std::wstring> define_values;
+          std::vector<DxcDefine> new_defines;
+          if (defines != nullptr)
+@@ -713,11 +726,11 @@ namespace Shader
+             // Convert to UTF-16.
+             while (cursor != nullptr && cursor->Name != nullptr)
+             {
+-               define_values.emplace_back(CA2W(cursor->Name, CP_UTF8));
++               define_values.emplace_back(Utf8ToWide(cursor->Name));
+                if (cursor->Definition != nullptr)
+                {
+                   define_values.emplace_back(
+-                     CA2W(cursor->Definition, CP_UTF8));
++                     Utf8ToWide(cursor->Definition));
+                }
+                else
+                {
+@@ -775,8 +788,8 @@ namespace Shader
+          IFR(compiler->Compile(
+             source,
+             source_name,
+-            entrypoint_wide,
+-            target_profile_wide,
++            entrypoint_wide.c_str(),
++            target_profile_wide.c_str(),
+             arguments.data(),
+             (UINT)arguments.size(),
+             new_defines.data(),
+@@ -788,9 +801,9 @@ namespace Shader
+       {
+          return E_OUTOFMEMORY;
+       }
+-      catch (const CAtlException& err)
++      catch (HRESULT err)
+       {
+-         return err.m_hr;
++         return err;
+       }
+ 
+       operation_result->GetStatus(&hr);
+@@ -816,9 +829,9 @@ namespace Shader
+       ID3DBlob** code,
+       ID3DBlob** error_messages)
+    {
+-      CComPtr<IDxcLibrary> library;
+-      CComPtr<IDxcBlobEncoding> source;
+-      CComPtr<IDxcIncludeHandler> include_handler;
++      Microsoft::WRL::ComPtr<IDxcLibrary> library;
++      Microsoft::WRL::ComPtr<IDxcBlobEncoding> source;
++      Microsoft::WRL::ComPtr<IDxcIncludeHandler> include_handler;
+ 
+       *code = nullptr;
+       if (error_messages != nullptr)
+@@ -843,7 +856,7 @@ namespace Shader
+          return E_INVALIDARG;
+       }
+ 
+-      return CompileFromBlob(source, file_name, defines, include_handler, entrypoint, target, flags1, flags2, code, error_messages);
++      return CompileFromBlob(source.Get(), file_name, defines, include_handler.Get(), entrypoint, target, flags1, flags2, code, error_messages);
+    }
+ 
+    void CompileShaderFromFileDXC(std::vector<uint8_t>& output, LPCWSTR file_path, LPCSTR shader_target, const D3D_SHADER_MACRO* defines = nullptr, bool& error = dummy_bool, LPCSTR func_name = nullptr, std::string* out_error = nullptr)
+@@ -851,8 +864,8 @@ namespace Shader
+       if (func_name == nullptr)
+          func_name = "main";
+ 
+-      CComPtr<ID3DBlob> out_blob;
+-      CComPtr<ID3DBlob> error_blob;
++      Microsoft::WRL::ComPtr<ID3DBlob> out_blob;
++      Microsoft::WRL::ComPtr<ID3DBlob> error_blob;
+       // TODO: add optional input (code) blob here too
+       // TODO: add optional serialization to disk here too
+       HRESULT result = BridgeD3DCompileFromFile(
+@@ -909,7 +922,7 @@ namespace Shader
+    }
+ 
+    // Note: apparently FXC isn't thread safe so ideally we should only ever access it from one thread at any given time
+-   void CompileShaderFromFile(std::vector<uint8_t>& output, const CComPtr<ID3DBlob>& optional_uncompiled_code_input, LPCWSTR file_path, LPCSTR shader_target, const std::vector<std::string>& defines = {}, bool save_to_disk = false, bool& error = dummy_bool, std::string* out_error = nullptr, LPCWSTR file_write_path = nullptr, LPCSTR func_name = nullptr)
++   void CompileShaderFromFile(std::vector<uint8_t>& output, const Microsoft::WRL::ComPtr<ID3DBlob>& optional_uncompiled_code_input, LPCWSTR file_path, LPCSTR shader_target, const std::vector<std::string>& defines = {}, bool save_to_disk = false, bool& error = dummy_bool, std::string* out_error = nullptr, LPCWSTR file_write_path = nullptr, LPCSTR func_name = nullptr)
+    {
+       std::vector<D3D_SHADER_MACRO> local_defines;
+       FillDefines(defines, local_defines);
+diff --git a/Source/Games/Metaphor ReFantazio/Metaphor ReFantazio.vcxproj b/Source/Games/Metaphor ReFantazio/Metaphor ReFantazio.vcxproj
+index d0cd369..bf34b0f 100644
+--- a/Source/Games/Metaphor ReFantazio/Metaphor ReFantazio.vcxproj	
++++ b/Source/Games/Metaphor ReFantazio/Metaphor ReFantazio.vcxproj	
+@@ -302,6 +302,17 @@
+   <ItemGroup>
+     <ClCompile Include="..\..\Core\unity_build.cpp" />
+     <ClCompile Include="main.cpp" />
++    <ClCompile Include="$(SolutionDir)..\src\engine_enhancements.cpp">
++      <ForcedIncludeFiles></ForcedIncludeFiles>
++    </ClCompile>
++    <ClCompile Include="$(SolutionDir)..\vendor\safetyhook\safetyhook.cpp">
++      <ForcedIncludeFiles></ForcedIncludeFiles>
++    </ClCompile>
++    <ClCompile Include="$(SolutionDir)..\vendor\safetyhook\Zydis.c">
++      <ForcedIncludeFiles></ForcedIncludeFiles>
++      <AdditionalIncludeDirectories>$(SolutionDir)..\vendor\safetyhook;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <CompileAs>CompileAsC</CompileAs>
++    </ClCompile>
+   </ItemGroup>
+   <ItemGroup>
+     <ClInclude Include="blue_noise.h" />
+@@ -314,4 +325,4 @@
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+   <ImportGroup Label="ExtensionTargets">
+   </ImportGroup>
+-</Project>
+\ No newline at end of file
++</Project>
+diff --git a/Source/Games/Metaphor ReFantazio/main.cpp b/Source/Games/Metaphor ReFantazio/main.cpp
+index db20f99..fc640eb 100644
+--- a/Source/Games/Metaphor ReFantazio/main.cpp	
++++ b/Source/Games/Metaphor ReFantazio/main.cpp	
+@@ -11,6 +11,10 @@
+ #include "blue_noise.h"
+ #include "stretchy_buffer.h"
+ #include "temporal_aa_depth.h"
++#include "temporal_quality.h"
++#include "../../../../src/engine_enhancements.h"
++
++static MetaphorEnhancements::Settings engine_settings;
+ #define XXH_STATIC_LINKING_ONLY
+ #define XXH_IMPLEMENTATION
+ #include "xxhash.h"
+@@ -294,6 +298,15 @@ M_INLINE bool IsOutsideFrustum(const float4x4& worldViewProj, const BoundingBox&
+ 
+ struct DrawContextData
+ {
++   DrawContextData()
++   {
++      inv_proj.SetIdentity(); proj.SetIdentity(); proj_with_jitter.SetIdentity(); view.SetIdentity();
++      prev_inv_proj.SetIdentity(); prev_proj_with_current_jitter.SetIdentity(); prev_view_proj.SetIdentity();
++   }
++   bool camera_valid = false;
++   bool reset_history = true;
++   float2 history_jitter = {};
++
+    GFD_VSCONST_TRANSFORM vsconst_transform_data;
+    bool vsconst_transform_data_changed = false;
+ 
+@@ -373,6 +386,9 @@ struct ShadowContextData
+ 
+ namespace
+ {
++   float temporal_detail_bias = 0.f; // Stability first; upstream adds -1 even at native resolution.
++   bool particle_history_rejection = true;
++
+    bool first_boot = true; // Automatic setting
+    bool enable_hdr = false;
+    bool next_enable_hdr = enable_hdr; // The value we serialize, that will be ignored until reboot
+@@ -403,6 +419,7 @@ struct GameDeviceDataMetaphorReFantazio final : public GameDeviceData
+ #if ENABLE_SR
+    // SR
+    std::atomic<bool> has_drawn_upscaling = false;
++   uint64_t history_reset_count = 0;
+ 
+    // resources used to apply sr
+    ComPtr<ID3D11Texture2D> scaled_motion_vectors;
+@@ -584,6 +601,7 @@ public:
+       native_shaders_definitions.emplace(CompileTimeStringHash("Prepare Ocean Data"), ShaderDefinition{"Luma_PrepareOceanData", reshade::api::pipeline_subobject_type::compute_shader});
+       native_shaders_definitions.emplace(CompileTimeStringHash("Create Bias Mask"), ShaderDefinition{"Luma_CreateBiasMask", reshade::api::pipeline_subobject_type::compute_shader});
+       native_shaders_definitions.emplace(CompileTimeStringHash("Merge"), ShaderDefinition{"Luma_CopyDsrResult", reshade::api::pipeline_subobject_type::compute_shader});
++      native_shaders_definitions.emplace(CompileTimeStringHash("Fallback SR"), ShaderDefinition{"Luma_CopyDsrResult", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"SR_FALLBACK", "1"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("Temporal AA Depth With History"),
+          ShaderDefinition{"Luma_TemporalAADepth", reshade::api::pipeline_subobject_type::compute_shader, nullptr, nullptr, {{"HAS_PREVIOUS_FRAME", "1"}}});
+       native_shaders_definitions.emplace(CompileTimeStringHash("Temporal AA Depth Without History"),
+@@ -600,6 +618,19 @@ public:
+    void LoadConfigs() override
+    {
+       reshade::api::effect_runtime* runtime = nullptr;
++      reshade::get_config_value(runtime, NAME, "EngineSkipLogos", engine_settings.skip_logos);
++      reshade::get_config_value(runtime, NAME, "EngineSkipMovie", engine_settings.skip_movie);
++      reshade::get_config_value(runtime, NAME, "EngineMenuFPS", engine_settings.menu_fps);
++      reshade::get_config_value(runtime, NAME, "EngineDisableShake", engine_settings.disable_camera_shake);
++      reshade::get_config_value(runtime, NAME, "EngineControllerIcons", engine_settings.force_controller_icons);
++      reshade::get_config_value(runtime, NAME, "EngineFOV", engine_settings.gameplay_fov);
++      reshade::get_config_value(runtime, NAME, "EngineLOD", engine_settings.lod_distance);
++      reshade::get_config_value(runtime, NAME, "EngineShadowResolution", engine_settings.shadow_resolution);
++      MetaphorEnhancements::Sanitize(engine_settings);
++      reshade::get_config_value(runtime, NAME, "TemporalDetailBias", temporal_detail_bias);
++      if (!std::isfinite(temporal_detail_bias)) temporal_detail_bias = 0.f;
++      temporal_detail_bias = std::clamp(temporal_detail_bias, -1.f, 0.f);
++      reshade::get_config_value(runtime, NAME, "ParticleHistoryRejection", particle_history_rejection);
+       reshade::get_config_value(runtime, NAME, "SceneUiMsaaSamples", g_scene_ui_msaa_samples);
+       if (g_scene_ui_msaa_samples != 1 &&
+           g_scene_ui_msaa_samples != 2 &&
+@@ -642,6 +673,9 @@ public:
+ 
+    void OnInitDevice(ID3D11Device* native_device, DeviceData& device_data) override
+    {
++      MetaphorEnhancements::Initialize(engine_settings, [](const char* message) {
++         reshade::log::message(reshade::log::level::info, message);
++      });
+       auto& game_device_data = GetGameDeviceData(device_data);
+       {
+          D3D11_BUFFER_DESC bd = {};
+@@ -1321,6 +1355,8 @@ public:
+       DrawOrDispatchOverrideType overrideType = DrawOrDispatchOverrideType::None;
+       if (!context_data.frame_progress.Reached(FrameProgress::FrameStarted))
+       {
++         context_data.camera_valid = false;
++         context_data.reset_history = true;
+          context_data.ocean_lookup.clear();
+          context_data.ocean_buffer->Reset();
+ 
+@@ -1345,6 +1381,7 @@ public:
+          device_data.cb_luma_global_settings_dirty = true;
+          SetLumaConstantBuffers(native_device_context, cmd_list_data, device_data, reshade::api::shader_stage::all, LumaConstantBufferType::LumaSettings);
+ 
++         phases = (std::max)(phases, 1);
+          int temporal_frame = cb_luma_global_settings.GameSettings.FrameIndex % phases;
+          context_data.projection_jitters.x = SR::HaltonSequence(temporal_frame, 2);
+          context_data.projection_jitters.y = SR::HaltonSequence(temporal_frame, 3);
+@@ -1450,6 +1487,22 @@ public:
+                         context_data.proj_with_jitter.m12 += 2.0f * context_data.projection_jitters.y / (float)target_desc.Height;
+ 
+                         context_data.view = ps_const_system->mtxView;
++                        context_data.camera_valid = true;
++                        context_data.reset_history = !previous_context_data.camera_valid ||
++                           MetaphorTemporal::CameraDiscontinuity(context_data.view, previous_context_data.view,
++                              context_data.proj, previous_context_data.proj);
++                        context_data.history_jitter = {
++                           MetaphorTemporal::HistoryJitterPixels(context_data.projection_jitters.x, previous_context_data.projection_jitters.x,
++                              context_data.proj.m32, previous_context_data.proj.m32),
++                           MetaphorTemporal::HistoryJitterPixels(context_data.projection_jitters.y, previous_context_data.projection_jitters.y,
++                              context_data.proj.m32, previous_context_data.proj.m32)};
++                        if (context_data.reset_history)
++                        {
++                           context_data.prev_inv_proj = context_data.inv_proj;
++                           context_data.prev_proj_with_current_jitter = context_data.proj_with_jitter;
++                           context_data.prev_view_proj = context_data.proj_with_jitter * context_data.view;
++                           context_data.history_jitter = {0.f, 0.f};
++                        }
+                      }
+                   }
+ 
+@@ -2045,9 +2098,10 @@ public:
+             draw_data.input_mv_srv = context_data.motion_vectors_srv.get();
+             draw_data.use_variance_clip = true;
+             draw_data.variance_scale = 1.0f;
+-            draw_data.velocity_scale.x = -1.0f;
+-            draw_data.velocity_scale.y = -1.0f;
+-            draw_data.has_history = !device_data.force_reset_sr;
++            draw_data.velocity_scale.x = -0.5f;
++            draw_data.velocity_scale.y = 0.5f;
++            draw_data.history_jitter_uv = {context_data.history_jitter.x / draw_data.width, context_data.history_jitter.y / draw_data.height};
++            draw_data.has_history = !device_data.force_reset_sr && !context_data.reset_history;
+ 
+             ComPtr<ID3D11Device> native_device;
+             native_device_context->GetDevice(native_device.put());
+@@ -2189,9 +2243,10 @@ public:
+                      draw_data.input_mv_srv = context_data.motion_vectors_srv.get();
+                      draw_data.use_variance_clip = true;
+                      draw_data.variance_scale = 1.0f;
+-                     draw_data.velocity_scale.x = -1.0f;
+-                     draw_data.velocity_scale.y = -1.0f;
+-                     draw_data.has_history = !device_data.force_reset_sr;
++                     draw_data.velocity_scale.x = -0.5f;
++                     draw_data.velocity_scale.y = 0.5f;
++                     draw_data.history_jitter_uv = {context_data.history_jitter.x / draw_data.width, context_data.history_jitter.y / draw_data.height};
++                     draw_data.has_history = !device_data.force_reset_sr && !context_data.reset_history;
+ 
+                      ComPtr<ID3D11Device> native_device;
+                      native_device_context->GetDevice(native_device.put());
+@@ -2334,7 +2389,7 @@ public:
+              device_data.render_resolution.y > 0.0f &&
+              device_data.output_resolution.y > 0.0f)
+          {
+-            device_data.texture_mip_lod_bias_offset = std::log2(device_data.render_resolution.y / device_data.output_resolution.y) - 1.f; // This results in -1 at output res
++            device_data.texture_mip_lod_bias_offset = MetaphorTemporal::TextureBias(device_data.render_resolution.y, device_data.output_resolution.y, temporal_detail_bias);
+          }
+          else
+          {
+@@ -2552,15 +2607,15 @@ public:
+                device_data.output_resolution.x = output_width;
+                device_data.output_resolution.y = output_height;
+ 
+-               game_device_data.upscaling = device_data.render_resolution.x != device_data.output_resolution.x &&
++               game_device_data.upscaling = device_data.render_resolution.x != device_data.output_resolution.x ||
+                                             device_data.render_resolution.y != device_data.output_resolution.y;
+             }
+          }
+ 
+          CommandListData& cmd_list_data = *cmd_list->get_private_data<CommandListData>();
+-         SetLumaConstantBuffers(native_device_context.get(), cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaSettings);
+ 
+          auto* sr_instance_data = device_data.GetSRInstanceData();
++         bool sr_ready = false;
+          {
+             SR::SettingsData settings_data;
+             settings_data.output_width = device_data.output_resolution.x;
+@@ -2572,9 +2627,12 @@ public:
+             settings_data.inverted_depth = false;
+             settings_data.mvs_jittered = false;
+             settings_data.render_preset = dlss_render_preset;
+-            sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context.get(), settings_data);
++            sr_ready = sr_implementations[device_data.sr_type]->UpdateSettings(sr_instance_data, native_device_context.get(), settings_data);
+          }
++         SetLumaConstantBuffers(native_device_context.get(), cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaSettings);
+ 
++         sr_ready = sr_ready && context_data.camera_valid && context_data.motion_vectors_srv;
++         if (sr_ready)
+          {
+             ComPtr<ID3D11ShaderResourceView> depth_texture_srv;
+             {
+@@ -2583,17 +2641,20 @@ public:
+                srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srv_desc.Texture2D.MostDetailedMip = 0;
+                srv_desc.Texture2D.MipLevels = 1;
+-               device->CreateShaderResourceView(context_data.depth_texture.get(),
++               sr_ready = SUCCEEDED(device->CreateShaderResourceView(context_data.depth_texture.get(),
+                   &srv_desc,
+-                  depth_texture_srv.put());
++                  depth_texture_srv.put()));
+             }
+ 
+             {
+-               D3D11_MAPPED_SUBRESOURCE mapped_cbuffer;
+-               native_device_context->Map(game_device_data.cbuffer_motion_vector.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_cbuffer);
+-               float4x4* reprojection_matrix = (float4x4*)mapped_cbuffer.pData;
+-               *reprojection_matrix = context_data.prev_view_proj * context_data.view.GetTransposed().GetInverted().GetTransposed() * context_data.proj_with_jitter.GetTransposed().GetInverted().GetTransposed();
+-               native_device_context->Unmap(game_device_data.cbuffer_motion_vector.get(), 0);
++               D3D11_MAPPED_SUBRESOURCE mapped_cbuffer = {};
++               if (SUCCEEDED(native_device_context->Map(game_device_data.cbuffer_motion_vector.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_cbuffer)))
++               {
++                  float4x4* reprojection_matrix = (float4x4*)mapped_cbuffer.pData;
++                  *reprojection_matrix = context_data.prev_view_proj * context_data.view.GetTransposed().GetInverted().GetTransposed() * context_data.proj_with_jitter.GetTransposed().GetInverted().GetTransposed();
++                  native_device_context->Unmap(game_device_data.cbuffer_motion_vector.get(), 0);
++               }
++               else sr_ready = false;
+             }
+ 
+             ID3D11Buffer* cbs[] = {game_device_data.cbuffer_motion_vector.get()};
+@@ -2604,10 +2665,10 @@ public:
+             native_device_context->CSSetConstantBuffers(0, 1, cbs);
+             native_device_context->CSSetShaderResources(0, 2, srvs);
+             native_device_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+-            native_device_context->Dispatch((device_data.render_resolution.x + 7) / 8, (device_data.render_resolution.y + 7) / 8, 1);
++            if (sr_ready) native_device_context->Dispatch((device_data.render_resolution.x + 7) / 8, (device_data.render_resolution.y + 7) / 8, 1);
+          }
+ 
+-         if (context_data.particle_texture)
++         if (sr_ready && context_data.particle_texture)
+          {
+             ComPtr<ID3D11ShaderResourceView> particle_texture_srv;
+             {
+@@ -2616,9 +2677,9 @@ public:
+                srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                srv_desc.Texture2D.MostDetailedMip = 0;
+                srv_desc.Texture2D.MipLevels = 1;
+-               device->CreateShaderResourceView(context_data.particle_texture.get(),
++               sr_ready = SUCCEEDED(device->CreateShaderResourceView(context_data.particle_texture.get(),
+                   &srv_desc,
+-                  particle_texture_srv.put());
++                  particle_texture_srv.put()));
+             }
+ 
+             ID3D11ShaderResourceView* srvs[] = {particle_texture_srv.get()};
+@@ -2627,9 +2688,16 @@ public:
+             native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("Create Bias Mask")].get(), 0, 0);
+             native_device_context->CSSetShaderResources(0, 1, srvs);
+             native_device_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+-            native_device_context->Dispatch((device_data.render_resolution.x + 7) / 8, (device_data.render_resolution.y + 7) / 8, 1);
++            if (sr_ready) native_device_context->Dispatch((device_data.render_resolution.x + 7) / 8, (device_data.render_resolution.y + 7) / 8, 1);
+          }
+ 
++         // Inputs must no longer be bound for writing when NGX reads them.
++         ID3D11UnorderedAccessView* null_uavs[D3D11_PS_CS_UAV_REGISTER_COUNT] = {};
++         ID3D11ShaderResourceView* null_srvs[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
++         native_device_context->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, null_uavs, nullptr);
++         native_device_context->CSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, null_srvs);
++         bool sr_succeeded = false;
++         if (sr_ready && context_data.camera_valid)
+          {
+             SR::SuperResolutionImpl::DrawData draw_data;
+             draw_data.source_color = context_data.source_color.get();
+@@ -2640,11 +2708,13 @@ public:
+             draw_data.render_width = device_data.render_resolution.x;
+             draw_data.render_height = device_data.render_resolution.y;
+             draw_data.bias_mask = context_data.particle_texture ? game_device_data.bias_mask.get() : nullptr;
++            draw_data.current_color_bias = particle_history_rejection && context_data.particle_texture ? game_device_data.bias_mask.get() : nullptr;
+             draw_data.pre_exposure = 0.0f;
+             draw_data.jitter_x = context_data.projection_jitters.x;
+             draw_data.jitter_y = context_data.projection_jitters.y;
+             draw_data.vert_fov = context_data.fov;
+-            draw_data.reset = device_data.force_reset_sr;
++            draw_data.reset = device_data.force_reset_sr || context_data.reset_history;
++            if (draw_data.reset) ++game_device_data.history_reset_count;
+ 
+             bool multithread_protected = game_device_data.multithread ? game_device_data.multithread->GetMultithreadProtected() == TRUE : false;
+ 
+@@ -2655,15 +2725,20 @@ public:
+                locked = true;
+             }
+ 
+-            bool dlss_succeeded = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context.get(), draw_data);
+-            game_device_data.has_drawn_upscaling = dlss_succeeded;
+-            device_data.has_drawn_sr = dlss_succeeded;
++            sr_succeeded = sr_implementations[device_data.sr_type]->Draw(sr_instance_data, native_device_context.get(), draw_data);
+ 
+             if (locked)
+             {
+                game_device_data.multithread->Leave();
+             }
+          }
++         game_device_data.has_drawn_upscaling = sr_succeeded;
++         device_data.has_drawn_sr = sr_succeeded;
++         // NGX does not preserve compute state. Release its output bindings and
++         // restore our constants before reading the result in the merge pass.
++         native_device_context->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, null_uavs, nullptr);
++         native_device_context->CSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, null_srvs);
++         SetLumaConstantBuffers(native_device_context.get(), cmd_list_data, device_data, reshade::api::shader_stage::compute, LumaConstantBufferType::LumaSettings);
+          {
+             ComPtr<ID3D11Device> device;
+             native_device_context->GetDevice(device.put());
+@@ -2696,13 +2771,15 @@ public:
+                ID3D11ShaderResourceView* srvs[] = {resolve_texture_srv.get(), color_srv.get()};
+                ID3D11UnorderedAccessView* uavs[] = {game_device_data.merged_texture_uav.get()};
+                ID3D11SamplerState* samplers[] = {device_data.sampler_state_linear.get()};
+-               native_device_context->CSSetShader(device_data.native_compute_shaders[CompileTimeStringHash("Merge")].get(), 0, 0);
++               native_device_context->CSSetShader(device_data.native_compute_shaders[sr_succeeded ? CompileTimeStringHash("Merge") : CompileTimeStringHash("Fallback SR")].get(), 0, 0);
+                native_device_context->CSSetShaderResources(0, 2, srvs);
+                native_device_context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+                native_device_context->CSSetSamplers(0, 1, samplers);
+                native_device_context->Dispatch((device_data.output_resolution.x + 7) / 8, (device_data.output_resolution.y + 7) / 8, 1);
+             }
+ 
++            native_device_context->CSSetUnorderedAccessViews(0, D3D11_PS_CS_UAV_REGISTER_COUNT, null_uavs, nullptr);
++            native_device_context->CSSetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, null_srvs);
+             native_device_context->CopySubresourceRegion(context_data.dest_color.get(), 0, 0, 0, 0, game_device_data.merged_texture.get(), 0, nullptr);
+          }
+ 
+@@ -3016,6 +3093,33 @@ public:
+    {
+       reshade::api::effect_runtime* runtime = nullptr;
+ 
++      if (ImGui::CollapsingHeader("Engine enhancements (Lyall / MetaphorFix)"))
++      {
++         ImGui::TextWrapped("Changes below take effect after restarting the game.");
++         auto checkbox = [&](const char* label, const char* key, bool& value) {
++            if (ImGui::Checkbox(label, &value)) reshade::set_config_value(runtime, NAME, key, value);
++         };
++         checkbox("Skip startup logos", "EngineSkipLogos", engine_settings.skip_logos);
++         checkbox("Skip opening movie", "EngineSkipMovie", engine_settings.skip_movie);
++         checkbox("Remove menu 60 FPS limit", "EngineMenuFPS", engine_settings.menu_fps);
++         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Uses the game's FPS setting with V-Sync off.");
++         checkbox("Disable camera shake", "EngineDisableShake", engine_settings.disable_camera_shake);
++         checkbox("Always show controller prompts", "EngineControllerIcons", engine_settings.force_controller_icons);
++         if (ImGui::SliderFloat("Gameplay FOV multiplier", &engine_settings.gameplay_fov, 0.75f, 1.5f, "%.2f"))
++            reshade::set_config_value(runtime, NAME, "EngineFOV", engine_settings.gameplay_fov);
++         if (ImGui::SliderFloat("Draw distance", &engine_settings.lod_distance, 10.f, 50.f, "%.0f"))
++            reshade::set_config_value(runtime, NAME, "EngineLOD", engine_settings.lod_distance);
++         if (ImGui::IsItemHovered()) ImGui::SetTooltip("10 restores stock distances. Higher values can reduce performance.");
++         int shadow = engine_settings.shadow_resolution == 2048 ? 0 : engine_settings.shadow_resolution == 8192 ? 2 : 1;
++         if (ImGui::Combo("Shadow resolution", &shadow, "2048 (stock)\0" "4096\0" "8192\0"))
++         {
++            engine_settings.shadow_resolution = 2048 << shadow;
++            reshade::set_config_value(runtime, NAME, "EngineShadowResolution", engine_settings.shadow_resolution);
++         }
++         if (engine_settings != MetaphorEnhancements::ActiveSettings()) ImGui::TextUnformatted("Restart required to apply changes.");
++         for (const auto& status : MetaphorEnhancements::Status()) ImGui::TextUnformatted(status.c_str());
++      }
++
+       ImGui::NewLine();
+ 
+       if (ImGui::Checkbox("Enable HDR", &next_enable_hdr))
+@@ -3302,6 +3406,17 @@ public:
+       }
+ #endif
+ 
++      ImGui::TextUnformatted("ReFantazio temporal quality - experimental");
++      if (ImGui::SliderFloat("Texture detail bias", &temporal_detail_bias, -1.f, 0.f, "%.2f"))
++         reshade::set_config_value(runtime, NAME, "TemporalDetailBias", temporal_detail_bias);
++      if (ImGui::IsItemHovered())
++         ImGui::SetTooltip("0 favors stable textures. -1 matches Luma's sharper sampling and may increase shimmer.\nThe global custom mip bias, when enabled, overrides this setting.");
++      if (ImGui::Checkbox("Reject particle history", &particle_history_rejection))
++         reshade::set_config_value(runtime, NAME, "ParticleHistoryRejection", particle_history_rejection);
++      if (ImGui::IsItemHovered())
++         ImGui::SetTooltip("DLSS: reject history on particles with at least 50%% coverage.\nMay reduce trails but increase particle noise; disable to compare.");
++      ImGui::Text("History resets: %llu", static_cast<unsigned long long>(GetGameDeviceData(device_data).history_reset_count));
++
+       const char* upscaling_mode_names[] = {
+          "Auto",
+          "Yes",
+@@ -3403,10 +3518,11 @@ public:
+ 
+    void PrintImGuiAbout() override
+    {
+-      ImGui::Text("Metaphor: ReFantazio Luma mod - about and credits section", "");
++      ImGui::TextUnformatted("ReFantazio Enhanced 0.2 - based on Metaphor Luma and MetaphorFix");
+       ImGui::Text("Credits:\n"
+                   "Idarion\n"
+                   "Luma Framework: Pumbo\n"
++                  "Engine enhancements: Lyall / MetaphorFix (MIT)\n"
+                   "HDR implementation based on RenoDX mod by: Ritsu\n");
+       ImGui::Text("\nrenodx\n"
+                   "MIT License\n"
+@@ -3463,10 +3579,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+ {
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
+    {
+-      Globals::SetGlobals(PROJECT_NAME, "Metaphor: ReFantazio Luma mod");
++      Globals::SetGlobals(PROJECT_NAME, "ReFantazio Enhanced (Luma / Idarion / Lyall)");
+       Globals::DEVELOPMENT_STATE = Globals::ModDevelopmentState::Playable;
+-      Globals::VERSION = 1;
++      Globals::VERSION = 2;
+ 
++      // Borderless resolution queries must use physical pixels on scaled desktops.
++      // Otherwise a 4K display at 200% scaling becomes a 1920x1080 swap chain.
++      force_ignore_dpi = true;
+       enable_samplers_upgrade = true;
+ 
+       shader_hashes_tonemap.pixel_shaders.emplace(std::stoul("A7108284", nullptr, 16));
+@@ -3566,6 +3685,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+    }
+    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
+    {
++      if (lpReserved == nullptr) MetaphorEnhancements::Shutdown();
+       reshade::unregister_event<reshade::addon_event::execute_secondary_command_list>(MetaphorReFantazio::OnExecuteSecondaryCommandList);
+       reshade::unregister_event<reshade::addon_event::update_buffer_region_command>(MetaphorReFantazio::OnUpdateBufferRegionCommand);
+       reshade::unregister_event<reshade::addon_event::create_pipeline>(MetaphorReFantazio::OnCreatePipeline);
+@@ -3613,4 +3733,4 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+    }
+ 
+    return TRUE;
+-}
+\ No newline at end of file
++}
+diff --git a/Source/Games/Metaphor ReFantazio/temporal_aa_depth.h b/Source/Games/Metaphor ReFantazio/temporal_aa_depth.h
+index d00b62b..e567113 100644
+--- a/Source/Games/Metaphor ReFantazio/temporal_aa_depth.h	
++++ b/Source/Games/Metaphor ReFantazio/temporal_aa_depth.h	
+@@ -34,6 +34,7 @@ struct DrawData
+     bool use_variance_clip = true;
+     float variance_scale = 1.0f;
+     float2 velocity_scale = { 1.0f, 1.0f };
++    float2 history_jitter_uv = {};
+     bool has_history = false;
+ };
+ 
+@@ -43,6 +44,8 @@ struct alignas(16) CBufferData
+     int UseVarianceClipping;
+     float VarianceScale;
+     float2 VelocityScale = { 0.0, 0.0 };
++    float2 HistoryJitterUV = {};
++    float2 Padding = {};
+ };
+ 
+ struct Resource
+@@ -119,13 +122,15 @@ public:
+         }
+ 
+         // Create Textures
++        const bool history_valid = data.has_history && cached_width == data.width && cached_height == data.height
++            && resources[Texture::DepthHistoryRead].tex.get();
+         SetupTextures(device, data.width, data.height);
+ 
+         ID3D11SamplerState* cs_samplers[2] = { linear_sampler.get(), point_sampler.get() };
+         ID3D11ShaderResourceView* srvs[3] = { data.input_depth_srv, resources[Texture::DepthHistoryRead].srv.get(), data.input_mv_srv };
+         ID3D11UnorderedAccessView* uavs[1] = { resources[Texture::DepthHistoryWrite].uav.get() };
+         ID3D11Buffer* cbvs[] = { cbuffer.get() };
+-        const auto shader_hash = data.has_history ? Math::CompileTimeStringHash("Temporal AA Depth With History") : Math::CompileTimeStringHash("Temporal AA Depth Without History");
++        const auto shader_hash = history_valid ? Math::CompileTimeStringHash("Temporal AA Depth With History") : Math::CompileTimeStringHash("Temporal AA Depth Without History");
+         ID3D11ComputeShader* cs = device_data.native_compute_shaders.at(shader_hash).get();
+ 
+         D3D11_MAPPED_SUBRESOURCE mapped_buffer;
+@@ -158,6 +163,7 @@ private:
+         cbuffer.UseVarianceClipping = data.use_variance_clip ? 1 : 0;
+         cbuffer.VarianceScale = data.variance_scale;
+         cbuffer.VelocityScale = data.velocity_scale;
++        cbuffer.HistoryJitterUV = data.history_jitter_uv;
+     }
+ 
+     void SetupTextures(ID3D11Device* device, uint32_t width, uint32_t height)
+@@ -239,4 +245,4 @@ private:
+     uint32_t cached_width = 0;
+     uint32_t cached_height = 0;
+ };
+-} // namespace TemporalAADepth
+\ No newline at end of file
++} // namespace TemporalAADepth
+diff --git a/Source/Games/Metaphor ReFantazio/temporal_quality.h b/Source/Games/Metaphor ReFantazio/temporal_quality.h
+new file mode 100644
+index 0000000..3c8d955
+--- /dev/null
++++ b/Source/Games/Metaphor ReFantazio/temporal_quality.h	
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++
++namespace MetaphorTemporal
++{
++   // m02/m12 jitter divided by clip.w gives a UV shift of -jitter/m32.
++   // Derive the sign from the actual projection (left- or right-handed).
++   inline float HistoryJitterPixels(float current, float previous, float current_m32, float previous_m32)
++   {
++      if (!std::isfinite(current_m32) || !std::isfinite(previous_m32)
++         || std::abs(current_m32) < 1e-6f || std::abs(previous_m32) < 1e-6f)
++         return 0.f;
++      return current / current_m32 - previous / previous_m32;
++   }
++
++   // Conservative discontinuity detection, independent of the game's world units.
++   // Translation alone cannot distinguish a teleport from a fast continuous pan.
++   template<class Matrix>
++   bool CameraDiscontinuity(const Matrix& view, const Matrix& previous_view,
++      const Matrix& projection, const Matrix& previous_projection)
++   {
++      const float axes[3][3] = {{view.m00, view.m01, view.m02}, {view.m10, view.m11, view.m12}, {view.m20, view.m21, view.m22}};
++      const float previous_axes[3][3] = {{previous_view.m00, previous_view.m01, previous_view.m02},
++         {previous_view.m10, previous_view.m11, previous_view.m12}, {previous_view.m20, previous_view.m21, previous_view.m22}};
++      float trace = 0.f;
++      for (int i = 0; i < 3; ++i)
++      {
++         float dot = 0.f, a2 = 0.f, b2 = 0.f;
++         for (int j = 0; j < 3; ++j)
++         {
++            dot += axes[i][j] * previous_axes[i][j];
++            a2 += axes[i][j] * axes[i][j];
++            b2 += previous_axes[i][j] * previous_axes[i][j];
++         }
++         if (!std::isfinite(dot) || !std::isfinite(a2 * b2) || a2 * b2 < 1e-12f)
++            return true;
++         trace += dot / std::sqrt(a2 * b2);
++      }
++      // trace(R) = 1 + 2 cos(angle): reset for a >60 degree cut in one frame.
++      if (trace < 2.f) return true;
++      const float current[] = {projection.m00, projection.m11};
++      const float previous[] = {previous_projection.m00, previous_projection.m11};
++      for (int i = 0; i < 2; ++i)
++      {
++         if (!std::isfinite(current[i]) || !std::isfinite(previous[i]) || std::abs(previous[i]) < 1e-6f
++            || std::abs(current[i] / previous[i] - 1.f) > 0.2f)
++            return true;
++      }
++      return false;
++   }
++
++   inline float TextureBias(float render_height, float output_height, float detail_bias)
++   {
++      if (!(render_height > 0.f) || !(output_height > 0.f)) return 0.f;
++      return std::log2(render_height / (std::max)(render_height, output_height)) + detail_bias;
++   }
++}
