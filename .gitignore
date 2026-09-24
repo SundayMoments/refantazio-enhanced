@@ -29,3 +29,4 @@ pcconfig.dat
 ReShade.ini
 ReShadePreset.ini
 codex-clipboard-*
+/helper/target/

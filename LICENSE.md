@@ -10,12 +10,22 @@ notices remain in force:
 | ReShade-derived changes | [BSD 3-Clause](licenses/ReShade-BSD.txt) |
 | SafetyHook | [Boost Software License 1.0](licenses/SafetyHook-Boost.txt) |
 | Zydis/Zycore amalgamation | [MIT notices](licenses/Zydis-MIT.txt) |
+| Bundled NVIDIA DLSS runtime | [NVIDIA RTX SDK terms](licenses/NVIDIA-DLSS.txt) |
+| Bundled Visual C++ runtime | [Microsoft runtime terms](licenses/Microsoft-VC-Runtime.txt) |
 
 Original ReFantazio Enhanced additions are offered under the same Custom MIT
 terms below. This does not replace the upstream notices or grant rights to
 proprietary NVIDIA runtime/SDK files or to the game. Those files are not part of
 this source repository. Dependencies obtained during development retain their
 own licenses.
+
+Binary bundles include proprietary runtime components under their own terms,
+separate from the Custom MIT license. NVIDIA portions are distributed subject
+to the NVIDIA terms linked above, including their license restrictions and
+intellectual-property protections. This software contains source code provided
+by NVIDIA Corporation. NVIDIA RTX is a trademark of NVIDIA Corporation.
+Rust, font, and native dependency notices are included in the helper and in
+`Luma/licenses`; they apply only to their respective components.
 
 ## Custom MIT License for original project additions
 

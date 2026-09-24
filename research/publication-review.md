@@ -26,9 +26,14 @@ formats and private-key material. Copyright notices, upstream author names and
 upstream source links are deliberately preserved. Generic installation paths
 and documented test hardware/software versions are not personal account data.
 
-Only source is published. No release binary or local build archive is uploaded.
-Compiled files can embed absolute paths even when their sources do not; binary
-releases require a separate artifact review and appropriate third-party notices.
+The initial publication contained source only. The 0.2.1 helper release adds a
+separately reviewed executable, its SHA-256 digest, and bundled dependency notices.
+Its Rust build remaps workspace/profile paths and strips debug symbols. The helper
+and every uncompressed payload file are checked for local profile paths and private
+identifiers; PE debug records are inspected separately. No game executable, saves,
+user INI files, original-file backups, PDBs, or local logs are in the release.
+NVIDIA and Microsoft DLLs remain unmodified. Their terms, upstream mod licenses,
+Rust dependency notices, and font notices accompany the executable and are embedded.
 
 This review is evidence about this publication, not a guarantee that future
 commits or attachments cannot disclose information. Review logs, screenshots,

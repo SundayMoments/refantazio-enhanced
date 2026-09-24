@@ -19,6 +19,11 @@ It would not exist without these projects and their contributors.
   their included MIT notices.
 - **NVIDIA** — the proprietary DLSS/NGX technology used through Luma's backend.
   NVIDIA's runtime is not authored or relicensed by this project.
+- **NVIDIA RTX™** technology is used for DLSS. This software contains source
+  code provided by NVIDIA Corporation.
+- **Microsoft** — the unmodified Visual C++ runtime redistributed with the mod.
+- **egui/eframe and the Rust dependency contributors** — the offline desktop
+  helper. Exact dependency and font notices are bundled in `Luma/licenses`.
 
 ReFantazio Enhanced adds targeted correctness fixes, integration safeguards,
 regression tests, reproducible source patches and selected engine improvements.

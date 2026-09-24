@@ -96,3 +96,23 @@ Borderless mode follows Windows' display refresh rate (120 Hz on this machine).
 No claim of locked 120 FPS performance or superior gameplay image quality is
 made from these tests. FOV/controller/shake options default to original behavior
 and still require scene testing when enabled.
+
+## Rust helper (0.2.1)
+
+The helper embeds its entire compressed mod bundle and a per-file SHA-256 manifest.
+Its application code contains no HTTP/socket client, updater, downloader, browser
+launch, telemetry, or account integration. Steam discovery reads local registry
+keys and library manifests. The only explicit process launch is an optional UAC
+relaunch of the same helper executable after the user clicks the administrator button.
+Dependencies are locked; helper compilation uses Cargo's offline mode. Development
+dependency provisioning and publishing a release are separate, explicit operations.
+
+It reads/writes only the selected game folder and its own temporary staging files;
+it does not change driver settings, firewall rules, game display configuration, or saves.
+The full 162-file embedded bundle passed installation, hash verification, and removal
+in a temporary fixture. 18 helper tests pass, covering recovery, conflicts, backup
+integrity, path validation, junction rejection, process guards, and INI preservation.
+The one ignored test is a child-process fixture launched by the passing process-guard test.
+
+This describes helper code behavior. Windows file dialogs, certificate validation,
+and proprietary NVIDIA components retain their own platform/vendor behavior.
